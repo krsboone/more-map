@@ -72,7 +72,11 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
     m = _FM_RE.match(text)
     if not m:
         return {}, text
-    data = yaml.safe_load(m.group(1)) or {}
+    try:
+        data = yaml.safe_load(m.group(1)) or {}
+    except yaml.YAMLError as e:
+        print(f"Warning: YAML parse error in frontmatter: {e}", file=sys.stderr)
+        data = {}
     return data, text[m.end():]
 
 
