@@ -60,6 +60,24 @@ class Handoff:
     tags: list[str]
     created: Optional[date]
     updated: Optional[date]
+    expires_after: Optional[str] = None
+
+
+@dataclass
+class Constraint:
+    id: str
+    subject: str
+    scope: str
+    project: Optional[str]
+    exempt: list[str]
+    tags: list[str]
+
+
+@dataclass
+class Experience:
+    date: Optional[date]
+    subject: str
+    tags: list[str] = field(default_factory=list)
 
 
 # ── Parsing ────────────────────────────────────────────────────────────────────
@@ -167,11 +185,58 @@ def load_handoffs(more_path: Path) -> list[Handoff]:
             tags=list(fm.get('tags') or []),
             created=_to_date(fm.get('created')),
             updated=_to_date(fm.get('updated')),
+            expires_after=fm.get('expires_after'),
         ))
     return handoffs
 
 
+def load_constraints(more_path: Path) -> list[Constraint]:
+    constraints_dir = more_path / 'constraints'
+    if not constraints_dir.exists():
+        return []
+    constraints = []
+    for f in sorted(constraints_dir.glob('*.md')):
+        fm, _ = _parse_frontmatter(f.read_text())
+        if not fm or fm.get('status') != 'active':
+            continue
+        constraints.append(Constraint(
+            id=str(fm.get('id', f.stem)),
+            subject=str(fm.get('subject', '')),
+            scope=str(fm.get('scope', 'unknown')),
+            project=fm.get('project'),
+            exempt=list(fm.get('exempt') or []),
+            tags=list(fm.get('tags') or []),
+        ))
+    return constraints
+
+
+def load_experiences(more_path: Path) -> list[Experience]:
+    experience_dir = more_path / 'experience'
+    if not experience_dir.exists():
+        return []
+    experiences = []
+    for f in sorted(experience_dir.glob('*.md')):
+        fm, _ = _parse_frontmatter(f.read_text())
+        if not fm or fm.get('status') != 'active':
+            continue
+        experiences.append(Experience(
+            date=_to_date(fm.get('created')),
+            subject=str(fm.get('subject', '')),
+            tags=list(fm.get('tags') or []),
+        ))
+    experiences.sort(key=lambda e: e.date or date.min)
+    return experiences
+
+
 # ── Rendering helpers ──────────────────────────────────────────────────────────
+
+# Handoff statuses recognized by the spec, in display order. Anything else
+# (including stray values) is grouped under 'unknown' rather than dropped.
+HANDOFF_STATUS_ORDER = ['active', 'partial', 'resolved', 'superseded', 'expired', 'deprecated']
+
+INDEX_MAX_LINES = 200
+STALE_DAYS = 30
+
 
 def _first_line(text: str, max_len: int = 72) -> str:
     for line in text.splitlines():
@@ -186,27 +251,65 @@ def _bar(n: int, max_n: int, width: int = 18) -> str:
     return '█' * filled + '░' * (width - filled)
 
 
-def _topic_counts(sessions: list[Session], handoffs: list[Handoff]) -> Counter:
+def _topic_counts(sessions: list[Session], handoffs: list[Handoff],
+                   constraints: list['Constraint'], experiences: list['Experience']) -> Counter:
     c: Counter = Counter()
     for s in sessions:
         c.update(s.tags)
     for h in handoffs:
         c.update(h.tags)
+    for con in constraints:
+        c.update(con.tags)
+    for e in experiences:
+        c.update(e.tags)
     # strip generic tags that don't reveal topic shape
     for noise in ('journal', 'handoff', 'active', 'confirmed', 'ai'):
         c.pop(noise, None)
     return c
 
 
+def _ordered_statuses(by_status: dict[str, list]) -> list[str]:
+    """Known statuses first in spec order, then any unrecognized ones."""
+    ordered = [s for s in HANDOFF_STATUS_ORDER if s in by_status]
+    ordered += sorted(s for s in by_status if s not in HANDOFF_STATUS_ORDER)
+    return ordered
+
+
+def _stale_days(h: Handoff, today: date) -> Optional[int]:
+    """Days since a still-open handoff was last touched, if past the threshold."""
+    if h.status not in ('active', 'partial'):
+        return None
+    last_touch = h.updated or h.created
+    if not last_touch:
+        return None
+    age = (today - last_touch).days
+    return age if age > STALE_DAYS else None
+
+
+def _memory_index_lines(more_path: Path) -> Optional[int]:
+    memory_file = more_path / 'MEMORY.md'
+    if not memory_file.exists():
+        return None
+    return len(memory_file.read_text().splitlines())
+
+
 # ── Plain-text output ──────────────────────────────────────────────────────────
 
-def _plain(sessions: list[Session], handoffs: list[Handoff]) -> None:
+def _plain(sessions: list[Session], handoffs: list[Handoff],
+           constraints: list[Constraint], experiences: list[Experience],
+           more_path: Path) -> None:
     W = 70
     span = f"{sessions[0].date}  →  {sessions[-1].date}" if sessions else "–"
+    today = date.today()
 
     print('━' * W)
     print("  more-map · collaboration portrait")
-    print(f"  {len(sessions)} sessions · {len(handoffs)} handoffs · {span}")
+    print(f"  {len(sessions)} sessions · {len(handoffs)} handoffs · "
+          f"{len(constraints)} constraints · {span}")
+    index_lines = _memory_index_lines(more_path)
+    if index_lines is not None:
+        over = "  ⚠ over recommended size" if index_lines > INDEX_MAX_LINES else ""
+        print(f"  MEMORY.md: {index_lines}/{INDEX_MAX_LINES} lines{over}")
     print('━' * W)
 
     # Timeline
@@ -217,28 +320,45 @@ def _plain(sessions: list[Session], handoffs: list[Handoff]) -> None:
         if built:
             print(f"             ↳  {built}")
 
+    # Constraints
+    if constraints:
+        print("\n  CONSTRAINTS\n")
+        for c in constraints:
+            scope_label = f"project: {c.project}" if c.scope == 'project' and c.project else c.scope
+            subj = (c.subject[:55] + '…') if len(c.subject) > 55 else c.subject
+            print(f"  [{scope_label}]  {subj}")
+            if c.exempt:
+                print(f"      exempt: {', '.join(c.exempt)}")
+
     # Handoffs
     print("\n  HANDOFFS\n")
     by_status: dict[str, list[Handoff]] = {}
     for h in handoffs:
         by_status.setdefault(h.status, []).append(h)
-    for status in ('active', 'partial', 'complete', 'archived', 'unknown'):
-        group = by_status.get(status, [])
-        if not group:
-            continue
+    for status in _ordered_statuses(by_status):
+        group = by_status[status]
         print(f"  {status.upper()}  ({len(group)})")
         for h in group:
             subj = (h.subject[:60] + '…') if len(h.subject) > 60 else h.subject
-            print(f"    ·  {h.id:<30}  {subj}")
+            stale = _stale_days(h, today)
+            marker = f"   ⚠ stale {stale}d" if stale else ""
+            print(f"    ·  {h.id:<30}  {subj}{marker}")
         print()
 
     # Topics
-    counts = _topic_counts(sessions, handoffs)
+    counts = _topic_counts(sessions, handoffs, constraints, experiences)
     if counts:
         print("  TOPIC THREADS\n")
         max_n = counts.most_common(1)[0][1]
         for tag, n in counts.most_common(18):
             print(f"  {tag:<24}  {_bar(n, max_n)}  {n}")
+
+    # Growth
+    if experiences:
+        print("\n\n  GROWTH\n")
+        for e in experiences:
+            d = str(e.date) if e.date else '?'
+            print(f"  {d}  {_first_line(e.subject, 58)}")
 
     # Tone strip
     print("\n\n  TONE OVER TIME\n")
@@ -251,13 +371,29 @@ def _plain(sessions: list[Session], handoffs: list[Handoff]) -> None:
 
 # ── Rich output ────────────────────────────────────────────────────────────────
 
-def _rich(sessions: list[Session], handoffs: list[Handoff]) -> None:
+HANDOFF_STATUS_COLOR = {
+    'active': 'green', 'partial': 'yellow', 'resolved': 'dim',
+    'superseded': 'dim', 'expired': 'red', 'deprecated': 'dim',
+}
+
+CONSTRAINT_SCOPE_COLOR = {'global': 'red', 'project': 'magenta'}
+
+
+def _rich(sessions: list[Session], handoffs: list[Handoff],
+          constraints: list[Constraint], experiences: list[Experience],
+          more_path: Path) -> None:
     console = Console()
     span = f"{sessions[0].date}  →  {sessions[-1].date}" if sessions else "–"
+    today = date.today()
 
     console.rule(style="dim")
     console.print(f"[bold]  more-map[/bold] [dim]· collaboration portrait[/dim]")
-    console.print(f"  [dim]{len(sessions)} sessions · {len(handoffs)} handoffs · {span}[/dim]")
+    console.print(f"  [dim]{len(sessions)} sessions · {len(handoffs)} handoffs · "
+                   f"{len(constraints)} constraints · {span}[/dim]")
+    index_lines = _memory_index_lines(more_path)
+    if index_lines is not None:
+        over = "  [red]⚠ over recommended size[/red]" if index_lines > INDEX_MAX_LINES else ""
+        console.print(f"  [dim]MEMORY.md: {index_lines}/{INDEX_MAX_LINES} lines[/dim]{over}")
     console.rule(style="dim")
 
     # Timeline
@@ -273,26 +409,36 @@ def _rich(sessions: list[Session], handoffs: list[Handoff]) -> None:
         t.add_row(str(s.date), cell)
     console.print(t)
 
+    # Constraints
+    if constraints:
+        console.print()
+        console.print("  [bold]CONSTRAINTS[/bold]")
+        for c in constraints:
+            color = CONSTRAINT_SCOPE_COLOR.get(c.scope, 'white')
+            scope_label = f"project: {c.project}" if c.scope == 'project' and c.project else c.scope
+            subj = (c.subject[:58] + '…') if len(c.subject) > 58 else c.subject
+            console.print(f"    · [{color}]{scope_label}[/{color}]  {subj}")
+            if c.exempt:
+                console.print(f"        [dim]exempt: {', '.join(c.exempt)}[/dim]")
+
     # Handoffs
     console.print()
     console.print("  [bold]HANDOFFS[/bold]")
     by_status: dict[str, list[Handoff]] = {}
     for h in handoffs:
         by_status.setdefault(h.status, []).append(h)
-    STATUS_COLOR = {'active': 'green', 'partial': 'yellow',
-                    'complete': 'dim',  'archived': 'dim'}
-    for status in ('active', 'partial', 'complete', 'archived', 'unknown'):
-        group = by_status.get(status, [])
-        if not group:
-            continue
-        color = STATUS_COLOR.get(status, 'white')
+    for status in _ordered_statuses(by_status):
+        group = by_status[status]
+        color = HANDOFF_STATUS_COLOR.get(status, 'white')
         console.print(f"\n  [{color}]{status.upper()}[/{color}]  ({len(group)})")
         for h in group:
             subj = (h.subject[:62] + '…') if len(h.subject) > 62 else h.subject
-            console.print(f"    · [bold]{h.id}[/bold]  [dim]{subj}[/dim]")
+            stale = _stale_days(h, today)
+            marker = f"  [yellow]⚠ stale {stale}d[/yellow]" if stale else ""
+            console.print(f"    · [bold]{h.id}[/bold]  [dim]{subj}[/dim]{marker}")
 
     # Topics
-    counts = _topic_counts(sessions, handoffs)
+    counts = _topic_counts(sessions, handoffs, constraints, experiences)
     if counts:
         console.print()
         console.print("\n  [bold]TOPIC THREADS[/bold]\n")
@@ -303,6 +449,18 @@ def _rich(sessions: list[Session], handoffs: list[Handoff]) -> None:
         t.add_column(justify="right", style="dim")
         for tag, n in counts.most_common(18):
             t.add_row(tag, _bar(n, max_n), str(n))
+        console.print(t)
+
+    # Growth
+    if experiences:
+        console.print()
+        console.print("\n  [bold]GROWTH[/bold]\n")
+        t = Table(box=None, padding=(0, 2), show_header=False)
+        t.add_column(style="dim cyan", no_wrap=True, width=12)
+        t.add_column()
+        for e in experiences:
+            d = str(e.date) if e.date else '?'
+            t.add_row(d, _first_line(e.subject, 60))
         console.print(t)
 
     # Tone strip
@@ -348,11 +506,13 @@ def main() -> None:
 
     sessions = load_sessions(more_path)
     handoffs = load_handoffs(more_path)
+    constraints = load_constraints(more_path)
+    experiences = load_experiences(more_path)
 
     if HAS_RICH and not args.no_color:
-        _rich(sessions, handoffs)
+        _rich(sessions, handoffs, constraints, experiences, more_path)
     else:
-        _plain(sessions, handoffs)
+        _plain(sessions, handoffs, constraints, experiences, more_path)
 
 
 if __name__ == '__main__':
